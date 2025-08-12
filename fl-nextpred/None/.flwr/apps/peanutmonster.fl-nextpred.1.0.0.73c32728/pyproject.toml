@@ -1,0 +1,37 @@
+[build-system]
+requires = [
+    "hatchling",
+]
+build-backend = "hatchling.build"
+
+[project]
+name = "fl-nextpred"
+version = "1.0.0"
+description = ""
+license = "Apache-2.0"
+dependencies = [
+    "flwr[simulation]>=1.19.0",
+    "flwr-datasets[vision]>=0.5.0",
+    "tensorflow>=2.11.1,<2.18.0",
+    "scikit-learn=1.7.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    ".",
+]
+
+[tool.flwr.app]
+publisher = "peanutmonster"
+
+[tool.flwr.app.components]
+serverapp = "fl_nextpred.server_app:app"
+clientapp = "fl_nextpred.client_app:app"
+
+[tool.flwr.app.config]
+num-server-rounds = 3
+local-epochs = 1
+batch-size = 16
+learning-rate = 0.005
+fraction-fit = 0.5
+verbose = true

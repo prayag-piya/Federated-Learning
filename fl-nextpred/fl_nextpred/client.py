@@ -1,109 +1,140 @@
+# client_pytorch.py
 import sys
-import logging
 import json
 import pickle
-import tensorflow as tf
-from typing import Tuple, Dict
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+from torch.utils.data import DataLoader, TensorDataset
 from flwr.client import NumPyClient, start_numpy_client
+from typing import Tuple, Dict
+from model import NextWordTransformer
+from utils.path_finder import read_data, load_dataset  # Your existing data utils
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
 from flwr.common.typing import NDArrays, Scalar
 
-from model import build_transformer_model, create_ngram_sequences
-from utils.path_finder import read_data, load_dataset
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-logging.basicConfig(level=logging.INFO)
 
-# Enable GPU memory growth
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print(f"[TensorFlow] GPU(s) available: {gpus}")
-    except RuntimeError as e:
-        print(f"[TensorFlow] GPU memory growth setup failed: {e}")
-else:
-    print("[TensorFlow] No GPU detected. Using CPU.")
+def create_ngram_sequences(text, tokenizer=None, max_len=20):
+    sentences = text.lower().split('\n')
 
-# Constants
-MAX_SEQ_LENGTH = 20
+    # Create tokenizer if not provided
+    if tokenizer is None:
+        tokenizer = Tokenizer(oov_token="<OOV>")
+        tokenizer.fit_on_texts(sentences)
 
-class NextWordPrediction(NumPyClient):
-    def __init__(self, model, X_train, y_train, epochs, batch_size, verbose):
-        self.model = model
-        self.X_train = X_train
-        self.y_train = y_train
+    sequences = []
+    for line in sentences:
+        token_list = tokenizer.texts_to_sequences([line])[0]
+        # Create n-gram sequences
+        for i in range(1, len(token_list)):
+            n_gram_seq = token_list[:i+1]
+            sequences.append(n_gram_seq)
+
+    # Pad/truncate sequences to max_len
+    sequences = pad_sequences(sequences, maxlen=max_len, padding='pre', truncating='pre')
+
+    # Split into features and labels
+    X_np = sequences[:, :-1]
+    y_np = sequences[:, -1]
+
+    # Convert to PyTorch tensors
+    X = torch.tensor(X_np, dtype=torch.long)
+    y = torch.tensor(y_np, dtype=torch.long)
+
+    return X, y, tokenizer
+
+
+class NextWordPredictionClient(NumPyClient):
+    def __init__(self, model, train_loader, epochs=20, verbose=1):
+        self.model = model.to(device)
+        self.train_loader = train_loader
         self.epochs = epochs
-        self.batch_size = batch_size
         self.verbose = verbose
+        self.criterion = nn.NLLLoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=1e-4)
 
-    def get_parameters(self, config) -> NDArrays:
-        return self.model.get_weights()
+    def get_parameters(self, config: Dict[str, Scalar]) -> NDArrays:
+        return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
-    def fit(self, parameters: NDArrays, config: Dict[str, Scalar]) -> Tuple[NDArrays, int, Dict[str, Scalar]]:
-        if not self.model.built:
-            self.model(tf.zeros((1, self.X_train.shape[1]), dtype=tf.int32))
-        self.model.set_weights(parameters)
-        self.model.fit(
-            self.X_train, self.y_train,
-            epochs=self.epochs,
-            batch_size=self.batch_size,
-            verbose=self.verbose
-        )
-        return self.model.get_weights(), len(self.X_train), {}
+    def set_parameters(self, parameters):
+        # Set model parameters from numpy arrays
+        params_dict = zip(self.model.state_dict().keys(), parameters)
+        state_dict = {k: torch.tensor(v) for k, v in params_dict}
+        self.model.load_state_dict(state_dict, strict=True)
 
-    def evaluate(self, parameters: NDArrays, config: Dict[str, Scalar]) -> Tuple[float, int, Dict[str, Scalar]]:
-        if not self.model.built:
-            self.model(tf.zeros((1, self.X_train.shape[1]), dtype=tf.int32))
-        self.model.set_weights(parameters)
-        loss, acc = self.model.evaluate(self.X_train, self.y_train, verbose=0)
-        return float(loss), len(self.X_train), {"accuracy": float(acc)}
+    def fit(self, parameters: NDArrays, config: Dict[str, Scalar]) -> Tuple[NDArrays, int, Dict]:
+        self.set_parameters(parameters)
+        self.model.train()
+        
+        for epoch in range(1, self.epochs + 1):
+            print(f"[Client] Training epoch {epoch}/{self.epochs}")
+            
+            batch_iter = tqdm(self.train_loader, desc=f"Epoch {epoch}", leave=False)
+            for X_batch, y_batch in batch_iter:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                self.optimizer.zero_grad()
+                output = self.model(X_batch)
+                loss = self.criterion(output, y_batch)
+                loss.backward()
+                self.optimizer.step()
+                batch_iter.set_postfix(loss=loss.item())
+        
+        # Save model after training
+        torch.save(self.model.state_dict(), f"client_model_epoch{self.epochs}.pt")
+        print(f"[Client] Model saved to client_model_epoch{self.epochs}.pt")
+        
+        return self.get_parameters(config={}), len(self.train_loader.dataset), {}
 
-def get_client() -> NextWordPrediction:
+    def evaluate(self, parameters, config) -> Tuple[float, int, Dict[str, float]]:
+        self.set_parameters(parameters)
+        self.model.eval()
+        correct, total, loss_sum = 0, 0, 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in self.train_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                output = self.model(X_batch)
+                loss = self.criterion(output, y_batch)
+                loss_sum += loss.item() * X_batch.size(0)
+                pred = output.argmax(dim=1)
+                correct += (pred == y_batch).sum().item()
+                total += X_batch.size(0)
+        loss_avg = loss_sum / total
+        accuracy = correct / total
+        return loss_avg, total, {"accuracy": accuracy}
+
+def start_client(server_address: str):
     dataset_path = "D:\\Lakehead\\Semester4\\Cloud_Computing\\Federated_Learning\\dataset"
     raw_text = read_data(dataset_path)
 
-    # Load config.json
     with open("configs\\config.json", "r") as f:
         config = json.load(f)
     vocab_size = config["vocab_size"]
     max_len = config["max_len"]
 
-    # Load saved tokenizer instead of recreating
     with open("model\\tokenizer.pkl", "rb") as f:
         tokenizer = pickle.load(f)
 
-    # Now generate sequences using existing tokenizer
-    # Modify create_ngram_sequences to accept tokenizer as an optional parameter
     sequences = create_ngram_sequences(raw_text, tokenizer=tokenizer, max_len=max_len)[0]
+    padded_sequences = torch.tensor(sequences, dtype=torch.long)
+    X_train, y_train = load_dataset(padded_sequences.numpy())  # Assuming this returns np arrays
 
-    padded_sequences = pad_sequences(sequences, maxlen=max_len, padding='pre', truncating='pre')
+    # Convert to tensors and dataloader
+    dataset = TensorDataset(torch.tensor(X_train, dtype=torch.long), torch.tensor(y_train, dtype=torch.long))
+    train_loader = DataLoader(dataset, batch_size=64, shuffle=True)
 
-    X_train, y_train = load_dataset(padded_sequences)
-    input_len = X_train.shape[1]
+    model = NextWordTransformer(vocab_size=vocab_size, max_len=max_len, embed_dim=128, num_heads=4, ff_dim=128, num_blocks=2, dropout=0.1)
 
-    model = build_transformer_model(
-        vocab_size=vocab_size,
-        max_len=input_len,
-        embed_dim=128,
-        num_heads=4,
-        ff_dim=128,
-        num_blocks=2,
-        dropout=0.1
-    )
-    model(tf.zeros((1, input_len), dtype=tf.int32))  # Build model
-
-    return NextWordPrediction(model, X_train, y_train, epochs=1, batch_size=64, verbose=1)
-
-def start_flower_client(server_address: str):
-    client = get_client()
-    print(f"[Client] Connecting to server at {server_address}...")
+    client = NextWordPredictionClient(model=model, train_loader=train_loader, epochs=30)
     start_numpy_client(server_address=server_address, client=client)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1].lower() != "client":
-        print("Usage: python script.py client <server_address>")
+        print("Usage: python client_pytorch.py client <server_address>")
         sys.exit(1)
-
     server_addr = sys.argv[2] if len(sys.argv) > 2 else "localhost:8080"
-    start_flower_client(server_addr)
+    start_client(server_addr)
